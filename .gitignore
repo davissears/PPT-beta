@@ -8,6 +8,10 @@ node_modules/
 # Fallow cache
 .fallow/
 
+# Generated reports
+coverage/
+_ppt-report/
+
 # Claude Code local settings
 .claude/settings.local.json
 
