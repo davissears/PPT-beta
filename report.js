@@ -185,12 +185,48 @@ function formatIssueLine(issue, idLabel) {
   return '  ' + parts.join('  ');
 }
 
-export function formatDiff(diff) {
+// Minimal ANSI color helpers. We avoid importing chalk into report.js to keep
+// the module dependency-free and easy to test; the escape sequences below are
+// the standard SGR codes that chalk also emits.
+const ANSI = {
+  reset: '\x1b[0m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
+  dim: '\x1b[2m',
+  bold: '\x1b[1m',
+};
+
+function wrap(code, text) {
+  return `${code}${text}${ANSI.reset}`;
+}
+
+export function formatDiff(diff, { color = false } = {}) {
   const sections = [];
   sections.push('Verification:');
-  sections.push(`  Fixed:       ${diff.fixedCount}`);
-  sections.push(`  Remaining:   ${diff.remainingCount}`);
-  sections.push(`  Introduced:  ${diff.introducedCount}`);
+
+  const fixedNum = String(diff.fixedCount);
+  const remainingNum = String(diff.remainingCount);
+  const introducedNum = String(diff.introducedCount);
+
+  if (color) {
+    const fixed = wrap(ANSI.green, fixedNum);
+    const remaining =
+      diff.remainingCount > 0
+        ? wrap(ANSI.yellow, remainingNum)
+        : wrap(ANSI.dim, remainingNum);
+    const introduced =
+      diff.introducedCount > 0
+        ? wrap(ANSI.red, introducedNum)
+        : wrap(ANSI.dim, introducedNum);
+    sections.push(`  Fixed:       ${fixed}`);
+    sections.push(`  Remaining:   ${remaining}`);
+    sections.push(`  Introduced:  ${introduced}`);
+  } else {
+    sections.push(`  Fixed:       ${fixedNum}`);
+    sections.push(`  Remaining:   ${remainingNum}`);
+    sections.push(`  Introduced:  ${introducedNum}`);
+  }
 
   if (diff.remaining && diff.remaining.length > 0) {
     sections.push('');
@@ -209,6 +245,50 @@ export function formatDiff(diff) {
   }
 
   return sections.join('\n');
+}
+
+/**
+ * Build a human-readable pre-agent summary block. Pure helper so it can be
+ * unit-tested without spinning up the whole CLI.
+ *
+ *   Found 22 issue(s):
+ *     dead-code: 12
+ *     dupes:      3
+ *     health:     7
+ *
+ *   Sending to: Claude Code (claude)
+ *   Working directory: /abs/path
+ *   Report: /abs/path/_ppt-report/<ts>.json
+ */
+export function formatPreAgentSummary(
+  { counts, total, agentName, command, dir, reportPath },
+  { color = false } = {},
+) {
+  const safeCounts = counts && typeof counts === 'object' ? counts : {};
+  const kinds = Object.keys(safeCounts);
+  const kindWidth = kinds.reduce((max, k) => Math.max(max, k.length + 1), 0);
+
+  const heading = `Found ${total} issue${total === 1 ? '' : '(s)'}:`;
+  const lines = [];
+  lines.push(color ? wrap(ANSI.bold, heading) : heading);
+
+  for (const kind of kinds) {
+    const label = `${kind}:`;
+    const padded = label.length < kindWidth ? label + ' '.repeat(kindWidth - label.length) : label;
+    lines.push(`  ${padded} ${safeCounts[kind]}`);
+  }
+
+  lines.push('');
+
+  const sendingLine = `Sending to: ${agentName}${command ? ` (${command})` : ''}`;
+  const dirLine = `Working directory: ${dir}`;
+  const reportLine = `Report: ${reportPath}`;
+
+  lines.push(sendingLine);
+  lines.push(color ? wrap(ANSI.dim, dirLine) : dirLine);
+  lines.push(color ? wrap(ANSI.dim, reportLine) : reportLine);
+
+  return lines.join('\n');
 }
 
 export function formatChecklist(summary) {

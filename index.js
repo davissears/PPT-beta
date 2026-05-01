@@ -13,6 +13,7 @@ import {
   formatChecklistFromIssues,
   diffSummaries,
   formatDiff,
+  formatPreAgentSummary,
 } from './report.js';
 
 export const MAX_ROUNDS = 3;
@@ -138,6 +139,24 @@ export async function mainFlow() {
 
   // Step 6: Invoke agent
   const config = await loadConfig();
+
+  // Pre-agent summary: tell the user exactly what we're about to do.
+  console.log(
+    '\n' +
+      formatPreAgentSummary(
+        {
+          counts: summaryBefore.countsByKind,
+          total: summaryBefore.total,
+          agentName: config.agent?.name ?? 'agent',
+          command: config.agent?.command ?? '',
+          dir,
+          reportPath,
+        },
+        { color: true },
+      ) +
+      '\n',
+  );
+
   await invokeAgent(config.agent, reportPath, dir, { checklist: report.checklist });
 
   // Step 7: Verification — re-run Fallow against the same directory, diff
@@ -146,8 +165,15 @@ export async function mainFlow() {
   const reportBase = path.basename(reportPath, '.json');
 
   async function verifyAgainst(prevSummary, baseLabel) {
-    console.log('Verifying...');
-    const verifyResults = await runFallow(dir);
+    const verifySpinner = ora('Verifying with Fallow...').start();
+    let verifyResults;
+    try {
+      verifyResults = await runFallow(dir);
+      verifySpinner.succeed(chalk.green('Verifying with Fallow...'));
+    } catch (err) {
+      verifySpinner.fail(chalk.red('Verifying with Fallow...'));
+      throw err;
+    }
     const verifyEntries = {};
     for (const key of selectedKeys) {
       verifyEntries[key] = verifyResults[key];
@@ -159,7 +185,7 @@ export async function mainFlow() {
     };
     const summaryAfter = summarizeReport(verifyReport);
     const diff = diffSummaries(prevSummary, summaryAfter);
-    console.log(formatDiff(diff));
+    console.log(formatDiff(diff, { color: true }));
 
     const verificationPath = path.join(reportDir, `${baseLabel}-verification.json`);
     await fsPromises.writeFile(
@@ -250,9 +276,25 @@ export async function mainFlow() {
     overallDiff = diff;
   }
 
-  console.log(
-    `Final: ${overallDiff.fixedCount} fixed, ${overallDiff.remainingCount} remaining, ${overallDiff.introducedCount} introduced over ${round} round${round === 1 ? '' : 's'}.`,
-  );
+  const finalLine = `Final: ${overallDiff.fixedCount} fixed, ${overallDiff.remainingCount} remaining, ${overallDiff.introducedCount} introduced over ${round} round${round === 1 ? '' : 's'}.`;
+
+  let coloredFinal;
+  if (overallDiff.introducedCount > 0) {
+    coloredFinal = chalk.red(finalLine);
+  } else if (overallDiff.remainingCount > 0) {
+    coloredFinal = chalk.yellow(finalLine);
+  } else {
+    coloredFinal = chalk.green(finalLine);
+  }
+  console.log(coloredFinal);
+
+  if (overallDiff.remainingCount === 0 && overallDiff.introducedCount === 0) {
+    console.log(chalk.green('All Fallow issues resolved.'));
+  } else {
+    console.log(
+      chalk.yellow(`Some issues remain — see verification report at ${reportDir}.`),
+    );
+  }
 }
 
 export async function runConfigWizard() {
