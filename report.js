@@ -244,3 +244,37 @@ export function formatChecklist(summary) {
   }
   return sections.join('\n');
 }
+
+/**
+ * Build a checklist string from a flat array of issue objects (the same
+ * shape produced by `summarizeReport().issues`). Used for retry rounds
+ * where only the remaining (unfixed) issues should be passed to the agent.
+ *
+ * The returned string starts with a count header, e.g.
+ *   "3 issues remaining from previous round:"
+ * followed by per-issue lines in the same format as `formatChecklist`.
+ */
+export function formatChecklistFromIssues(issues) {
+  const safe = Array.isArray(issues) ? issues : [];
+  const count = safe.length;
+  const header = `${count} issue${count === 1 ? '' : 's'} remaining from previous round:`;
+
+  if (count === 0) return header;
+
+  const kindWidth = safe.reduce((max, i) => Math.max(max, (i.kind || '').length), 0);
+
+  const lines = safe.map((issue) => {
+    const kindCol = padKind(issue.kind || '', kindWidth);
+    let location = '';
+    if (issue.file) {
+      location = issue.line != null ? `${issue.file}:${issue.line}` : issue.file;
+    }
+
+    const parts = [`[${issue.id}]`, kindCol];
+    if (location) parts.push(location);
+    if (issue.message) parts.push(issue.message);
+    return parts.join('  ');
+  });
+
+  return [header, '', lines.join('\n')].join('\n');
+}

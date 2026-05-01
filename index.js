@@ -7,7 +7,52 @@ import path from 'path';
 import { runFallow } from './fallow.js';
 import { invokeAgent, PRESETS } from './agents.js';
 import { loadConfig, saveConfig, isFirstRun } from './config.js';
-import { summarizeReport, formatChecklist, diffSummaries, formatDiff } from './report.js';
+import {
+  summarizeReport,
+  formatChecklist,
+  formatChecklistFromIssues,
+  diffSummaries,
+  formatDiff,
+} from './report.js';
+
+export const MAX_ROUNDS = 3;
+
+/**
+ * Pure decision function for the verify+retry loop. Given the current
+ * round's verification outcome, decides whether to run another round.
+ *
+ * Stop conditions (in order):
+ *   - remainingCount === 0          → reason: 'no-remaining'
+ *   - userConfirmed === false       → reason: 'user-declined'
+ *   - round >= maxRounds            → reason: 'max-rounds'
+ *   - remainingCount >= prevRemainingCount (no progress) → reason: 'no-progress'
+ *
+ * Otherwise returns { retry: true }.
+ */
+export function shouldRetry({
+  remainingCount,
+  prevRemainingCount,
+  round,
+  maxRounds,
+  userConfirmed,
+}) {
+  if (remainingCount === 0) {
+    return { retry: false, reason: 'no-remaining' };
+  }
+  if (!userConfirmed) {
+    return { retry: false, reason: 'user-declined' };
+  }
+  if (round >= maxRounds) {
+    return { retry: false, reason: 'max-rounds' };
+  }
+  if (
+    typeof prevRemainingCount === 'number' &&
+    remainingCount >= prevRemainingCount
+  ) {
+    return { retry: false, reason: 'no-progress' };
+  }
+  return { retry: true };
+}
 
 /**
  * Writes a Fallow report to `<dir>/_ppt-report/<timestamp>.json`,
@@ -97,29 +142,116 @@ export async function mainFlow() {
 
   // Step 7: Verification — re-run Fallow against the same directory, diff
   // against the original summary, print results, and persist the diff.
-  console.log('Verifying...');
-  const verifyResults = await runFallow(dir);
-  const verifyEntries = {};
-  for (const key of selectedKeys) {
-    verifyEntries[key] = verifyResults[key];
-  }
-  const verifyReport = {
-    directory: dir,
-    timestamp: new Date().toISOString(),
-    analyses: { ...verifyEntries },
-  };
-  const summaryAfter = summarizeReport(verifyReport);
-  const diff = diffSummaries(summaryBefore, summaryAfter);
-  console.log(formatDiff(diff));
-
-  // Persist alongside the original report.
   const reportDir = path.dirname(reportPath);
   const reportBase = path.basename(reportPath, '.json');
-  const verificationPath = path.join(reportDir, `${reportBase}-verification.json`);
-  await fsPromises.writeFile(
-    verificationPath,
-    JSON.stringify({ before: summaryBefore, after: summaryAfter, diff }, null, 2),
-    'utf8',
+
+  async function verifyAgainst(prevSummary, baseLabel) {
+    console.log('Verifying...');
+    const verifyResults = await runFallow(dir);
+    const verifyEntries = {};
+    for (const key of selectedKeys) {
+      verifyEntries[key] = verifyResults[key];
+    }
+    const verifyReport = {
+      directory: dir,
+      timestamp: new Date().toISOString(),
+      analyses: { ...verifyEntries },
+    };
+    const summaryAfter = summarizeReport(verifyReport);
+    const diff = diffSummaries(prevSummary, summaryAfter);
+    console.log(formatDiff(diff));
+
+    const verificationPath = path.join(reportDir, `${baseLabel}-verification.json`);
+    await fsPromises.writeFile(
+      verificationPath,
+      JSON.stringify({ before: prevSummary, after: summaryAfter, diff }, null, 2),
+      'utf8',
+    );
+    return { summaryAfter, diff };
+  }
+
+  // Round 1 verification (against the original summary).
+  let { summaryAfter, diff } = await verifyAgainst(summaryBefore, reportBase);
+
+  // Track totals across rounds (relative to the original summaryBefore).
+  // The diff returned by `verifyAgainst` is always against `summaryBefore`
+  // for round 1; for retry rounds we recompute against the original so the
+  // final summary numbers reflect overall progress.
+  let round = 1;
+  let prevRemainingCount = summaryBefore.total;
+  let overallDiff = diff;
+
+  while (true) {
+    const remainingCount = diff.remainingCount;
+
+    if (remainingCount === 0) {
+      // Nothing left — stop without prompting.
+      break;
+    }
+    if (round >= MAX_ROUNDS) {
+      // Out of rounds.
+      const stop = shouldRetry({
+        remainingCount,
+        prevRemainingCount,
+        round,
+        maxRounds: MAX_ROUNDS,
+        userConfirmed: true,
+      });
+      // stop is for clarity; we just break.
+      void stop;
+      break;
+    }
+
+    // Ask the user whether to retry this round.
+    const { retry: userConfirmed } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'retry',
+        message: `${remainingCount} issue${remainingCount === 1 ? '' : 's'} still remaining. Retry with the agent?`,
+        default: false,
+      },
+    ]);
+
+    const decision = shouldRetry({
+      remainingCount,
+      prevRemainingCount,
+      round,
+      maxRounds: MAX_ROUNDS,
+      userConfirmed,
+    });
+
+    if (!decision.retry) break;
+
+    // Build a fresh checklist from the remaining issues only.
+    const retryChecklist = formatChecklistFromIssues(diff.remaining);
+
+    // Write a per-round report file: <reportBase>-round-<N>.json.
+    const nextRound = round + 1;
+    const roundReport = {
+      directory: dir,
+      timestamp: new Date().toISOString(),
+      analyses: { ...selectedEntries },
+      remaining: diff.remaining,
+      checklist: retryChecklist,
+      round: nextRound,
+    };
+    const roundPath = path.join(reportDir, `${reportBase}-round-${nextRound}.json`);
+    await fsPromises.writeFile(roundPath, JSON.stringify(roundReport, null, 2), 'utf8');
+
+    // Re-invoke the agent with only the remaining issues.
+    await invokeAgent(config.agent, roundPath, dir, { checklist: retryChecklist });
+
+    // Re-verify against the original summary so reported counts are absolute.
+    prevRemainingCount = remainingCount;
+    round = nextRound;
+    const result = await verifyAgainst(summaryBefore, `${reportBase}-round-${round}`);
+    summaryAfter = result.summaryAfter;
+    diff = result.diff;
+    overallDiff = diff;
+  }
+
+  console.log(
+    `Final: ${overallDiff.fixedCount} fixed, ${overallDiff.remainingCount} remaining, ${overallDiff.introducedCount} introduced over ${round} round${round === 1 ? '' : 's'}.`,
   );
 }
 
