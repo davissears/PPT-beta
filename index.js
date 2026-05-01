@@ -2,13 +2,25 @@ import inquirer from 'inquirer';
 import ora from 'ora';
 import chalk from 'chalk';
 import fsPromises from 'fs/promises';
-import fs from 'fs';
 import path from 'path';
-import os from 'os';
 
 import { runFallow } from './fallow.js';
 import { invokeAgent, PRESETS } from './agents.js';
 import { loadConfig, saveConfig, isFirstRun } from './config.js';
+import { summarizeReport, formatChecklist } from './report.js';
+
+/**
+ * Writes a Fallow report to `<dir>/_ppt-report/<timestamp>.json`,
+ * creating the directory if needed. The file is persisted (not cleaned up).
+ * Returns the absolute path to the written report.
+ */
+export async function writeReport(report, dir) {
+  const reportDir = path.join(dir, '_ppt-report');
+  await fsPromises.mkdir(reportDir, { recursive: true });
+  const reportPath = path.join(reportDir, `${Date.now()}.json`);
+  await fsPromises.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8');
+  return reportPath;
+}
 
 export async function mainFlow() {
   // Step 1: Prompt for directory
@@ -70,18 +82,18 @@ export async function mainFlow() {
     analyses: { ...selectedEntries },
   };
 
-  // Step 5: Write report to OS temp directory
-  const reportPath = path.join(os.tmpdir(), `fallow-report-${Date.now()}.json`);
-  await fsPromises.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8');
+  // Build a structured, numbered checklist from the raw analyses so the
+  // agent has a canonical list of issues to address. The raw `analyses`
+  // are preserved so nothing downstream breaks.
+  const summary = summarizeReport(report);
+  report.checklist = formatChecklist(summary);
 
-  // Clean up temp file on process exit
-  process.on('exit', () => {
-    try { fs.unlinkSync(reportPath); } catch {}
-  });
+  // Step 5: Write report to <dir>/_ppt-report/<timestamp>.json (persisted)
+  const reportPath = await writeReport(report, dir);
 
   // Step 6: Invoke agent
   const config = await loadConfig();
-  await invokeAgent(config.agent, reportPath, dir);
+  await invokeAgent(config.agent, reportPath, dir, { checklist: report.checklist });
 }
 
 export async function runConfigWizard() {
