@@ -2,10 +2,10 @@ import { execa } from "execa";
 import { readFile } from "fs/promises";
 
 export const PRESETS = [
-  { name: "Claude Code", command: "claude", args: [],            promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}" },
-  { name: "Aider",       command: "aider",  args: ["--message"], promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}" },
-  { name: "Codex CLI",   command: "codex",  args: [],            promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}" },
-  { name: "Gemini CLI",  command: "gemini", args: ["--prompt"],  promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}" },
+  { name: "Claude Code", command: "claude", args: [],            promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}\n\nThere are no false positives. Evaluate and triage each issue independently. Assign tasks to sub agents whenever possible." },
+  { name: "Aider",       command: "aider",  args: ["--message"], promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}\n\nThere are no false positives. Evaluate and triage each issue independently. Assign tasks to sub agents whenever possible." },
+  { name: "Codex CLI",   command: "codex",  args: [],            promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}\n\nThere are no false positives. Evaluate and triage each issue independently. Assign tasks to sub agents whenever possible." },
+  { name: "Gemini CLI",  command: "gemini", args: ["--prompt"],  promptStyle: "inline", prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}\n\nThere are no false positives. Evaluate and triage each issue independently. Assign tasks to sub agents whenever possible." },
   { name: "Custom",      command: "",       args: [],            promptStyle: "inline", prompt: "" },
 ];
 

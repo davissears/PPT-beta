@@ -11,7 +11,7 @@ export const DEFAULT_CONFIG = {
     command: "claude",
     args: [],
     promptStyle: "inline",
-    prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}"
+    prompt: "Review and fix the issues found by Fallow static analysis:\n\n{reportContents}\n\nThere are no false positives. Evaluate and triage each issue independently. Assign tasks to sub agents whenever possible."
   }
 };
 
