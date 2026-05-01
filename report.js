@@ -109,6 +109,108 @@ function padKind(kind, width) {
   return kind + ' '.repeat(width - kind.length);
 }
 
+/**
+ * Build a stable key for an issue. Two issues are "the same" when their
+ * kind+file+line+message tuples are equal. `null` equals `null`.
+ */
+function issueKey(issue) {
+  return JSON.stringify([
+    issue.kind ?? null,
+    issue.file ?? null,
+    issue.line ?? null,
+    issue.message ?? null,
+  ]);
+}
+
+/**
+ * Diff two summary objects (output of summarizeReport). Returns
+ * { fixed, remaining, introduced, fixedCount, remainingCount, introducedCount }.
+ *
+ * - fixed: issues present in `before` but not in `after`
+ * - remaining: issues present in both (the `before` instance is preserved so
+ *   the original id is reported to the user)
+ * - introduced: issues present in `after` but not in `before`
+ */
+export function diffSummaries(before, after) {
+  const beforeIssues = (before && before.issues) || [];
+  const afterIssues = (after && after.issues) || [];
+
+  const beforeMap = new Map();
+  for (const issue of beforeIssues) {
+    beforeMap.set(issueKey(issue), issue);
+  }
+  const afterMap = new Map();
+  for (const issue of afterIssues) {
+    afterMap.set(issueKey(issue), issue);
+  }
+
+  const fixed = [];
+  const remaining = [];
+  const introduced = [];
+
+  for (const issue of beforeIssues) {
+    const key = issueKey(issue);
+    if (afterMap.has(key)) {
+      remaining.push(issue);
+    } else {
+      fixed.push(issue);
+    }
+  }
+
+  for (const issue of afterIssues) {
+    const key = issueKey(issue);
+    if (!beforeMap.has(key)) {
+      introduced.push(issue);
+    }
+  }
+
+  return {
+    fixed,
+    remaining,
+    introduced,
+    fixedCount: fixed.length,
+    remainingCount: remaining.length,
+    introducedCount: introduced.length,
+  };
+}
+
+function formatIssueLine(issue, idLabel) {
+  const parts = [`[${idLabel} ${issue.id}]`, issue.kind];
+  let location = '';
+  if (issue.file) {
+    location = issue.line != null ? `${issue.file}:${issue.line}` : issue.file;
+  }
+  if (location) parts.push(location);
+  if (issue.message) parts.push(issue.message);
+  return '  ' + parts.join('  ');
+}
+
+export function formatDiff(diff) {
+  const sections = [];
+  sections.push('Verification:');
+  sections.push(`  Fixed:       ${diff.fixedCount}`);
+  sections.push(`  Remaining:   ${diff.remainingCount}`);
+  sections.push(`  Introduced:  ${diff.introducedCount}`);
+
+  if (diff.remaining && diff.remaining.length > 0) {
+    sections.push('');
+    sections.push('Remaining:');
+    for (const issue of diff.remaining) {
+      sections.push(formatIssueLine(issue, 'old-id'));
+    }
+  }
+
+  if (diff.introduced && diff.introduced.length > 0) {
+    sections.push('');
+    sections.push('Introduced:');
+    for (const issue of diff.introduced) {
+      sections.push(formatIssueLine(issue, 'new-id'));
+    }
+  }
+
+  return sections.join('\n');
+}
+
 export function formatChecklist(summary) {
   const { total, countsByKind, issues } = summary;
   const kinds = Object.keys(countsByKind);

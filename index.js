@@ -7,7 +7,7 @@ import path from 'path';
 import { runFallow } from './fallow.js';
 import { invokeAgent, PRESETS } from './agents.js';
 import { loadConfig, saveConfig, isFirstRun } from './config.js';
-import { summarizeReport, formatChecklist } from './report.js';
+import { summarizeReport, formatChecklist, diffSummaries, formatDiff } from './report.js';
 
 /**
  * Writes a Fallow report to `<dir>/_ppt-report/<timestamp>.json`,
@@ -85,8 +85,8 @@ export async function mainFlow() {
   // Build a structured, numbered checklist from the raw analyses so the
   // agent has a canonical list of issues to address. The raw `analyses`
   // are preserved so nothing downstream breaks.
-  const summary = summarizeReport(report);
-  report.checklist = formatChecklist(summary);
+  const summaryBefore = summarizeReport(report);
+  report.checklist = formatChecklist(summaryBefore);
 
   // Step 5: Write report to <dir>/_ppt-report/<timestamp>.json (persisted)
   const reportPath = await writeReport(report, dir);
@@ -94,6 +94,33 @@ export async function mainFlow() {
   // Step 6: Invoke agent
   const config = await loadConfig();
   await invokeAgent(config.agent, reportPath, dir, { checklist: report.checklist });
+
+  // Step 7: Verification — re-run Fallow against the same directory, diff
+  // against the original summary, print results, and persist the diff.
+  console.log('Verifying...');
+  const verifyResults = await runFallow(dir);
+  const verifyEntries = {};
+  for (const key of selectedKeys) {
+    verifyEntries[key] = verifyResults[key];
+  }
+  const verifyReport = {
+    directory: dir,
+    timestamp: new Date().toISOString(),
+    analyses: { ...verifyEntries },
+  };
+  const summaryAfter = summarizeReport(verifyReport);
+  const diff = diffSummaries(summaryBefore, summaryAfter);
+  console.log(formatDiff(diff));
+
+  // Persist alongside the original report.
+  const reportDir = path.dirname(reportPath);
+  const reportBase = path.basename(reportPath, '.json');
+  const verificationPath = path.join(reportDir, `${reportBase}-verification.json`);
+  await fsPromises.writeFile(
+    verificationPath,
+    JSON.stringify({ before: summaryBefore, after: summaryAfter, diff }, null, 2),
+    'utf8',
+  );
 }
 
 export async function runConfigWizard() {
