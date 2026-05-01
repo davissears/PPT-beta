@@ -18,48 +18,23 @@ import {
 
 export const MAX_ROUNDS = 3;
 
-/**
- * Pure decision function for the verify+retry loop. Given the current
- * round's verification outcome, decides whether to run another round.
- *
- * Stop conditions (in order):
- *   - remainingCount === 0          → reason: 'no-remaining'
- *   - userConfirmed === false       → reason: 'user-declined'
- *   - round >= maxRounds            → reason: 'max-rounds'
- *   - remainingCount >= prevRemainingCount (no progress) → reason: 'no-progress'
- *
- * Otherwise returns { retry: true }.
- */
-export function shouldRetry({
-  remainingCount,
-  prevRemainingCount,
-  round,
-  maxRounds,
-  userConfirmed,
-}) {
-  if (remainingCount === 0) {
-    return { retry: false, reason: 'no-remaining' };
-  }
-  if (!userConfirmed) {
-    return { retry: false, reason: 'user-declined' };
-  }
-  if (round >= maxRounds) {
-    return { retry: false, reason: 'max-rounds' };
-  }
-  if (
-    typeof prevRemainingCount === 'number' &&
-    remainingCount >= prevRemainingCount
-  ) {
-    return { retry: false, reason: 'no-progress' };
-  }
-  return { retry: true };
+function noProgressStop(remainingCount, prevRemainingCount) {
+  const prev = typeof prevRemainingCount === 'number' ? prevRemainingCount : Infinity;
+  return remainingCount >= prev ? 'no-progress' : null;
 }
 
-/**
- * Writes a Fallow report to `<dir>/_ppt-report/<timestamp>.json`,
- * creating the directory if needed. The file is persisted (not cleaned up).
- * Returns the absolute path to the written report.
- */
+function stopReason({ remainingCount, prevRemainingCount, round, maxRounds, userConfirmed }) {
+  if (remainingCount === 0) return 'no-remaining';
+  if (!userConfirmed) return 'user-declined';
+  if (round >= maxRounds) return 'max-rounds';
+  return noProgressStop(remainingCount, prevRemainingCount);
+}
+
+export function shouldRetry(opts) {
+  const reason = stopReason(opts);
+  return reason ? { retry: false, reason } : { retry: true };
+}
+
 export async function writeReport(report, dir) {
   const reportDir = path.join(dir, '_ppt-report');
   await fsPromises.mkdir(reportDir, { recursive: true });
@@ -68,8 +43,7 @@ export async function writeReport(report, dir) {
   return reportPath;
 }
 
-export async function mainFlow() {
-  // Step 1: Prompt for directory
+async function promptDirectory() {
   const { dir } = await inquirer.prompt([
     {
       type: 'input',
@@ -78,26 +52,25 @@ export async function mainFlow() {
       default: process.cwd(),
     },
   ]);
+  return dir;
+}
 
-  // Step 2: Run analyses with spinners
-  const analysisKeys = ['dead-code', 'dupes', 'health'];
+function updateSpinner(spinner, success, label) {
+  if (success) spinner.succeed(chalk.green(label));
+  else spinner.fail(chalk.red(label));
+}
 
+async function runAnalysesWithSpinners(dir, analysisKeys) {
   const spinners = {};
-  for (const key of analysisKeys) {
-    spinners[key] = ora(key).start();
-  }
-
+  for (const key of analysisKeys) spinners[key] = ora(key).start();
   const results = await runFallow(dir);
-
   for (const key of analysisKeys) {
-    if (results[key]?.success) {
-      spinners[key].succeed(chalk.green(key));
-    } else {
-      spinners[key].fail(chalk.red(key));
-    }
+    updateSpinner(spinners[key], results[key] && results[key].success, key);
   }
+  return results;
+}
 
-  // Step 3: Checkbox prompt for analyses to include
+async function promptForAnalyses(analysisKeys, results) {
   const { selectedKeys } = await inquirer.prompt([
     {
       type: 'checkbox',
@@ -106,49 +79,41 @@ export async function mainFlow() {
       choices: analysisKeys.map((key) => ({
         name: key,
         value: key,
-        checked: results[key]?.success === true,
+        checked: results[key] && results[key].success === true,
       })),
     },
   ]);
+  return selectedKeys;
+}
 
-  if (selectedKeys.length === 0) {
-    console.log(chalk.red('No analyses selected. Exiting.'));
-    return;
-  }
-
-  // Step 4: Build report object
+function buildInitialReport(dir, selectedKeys, results) {
   const selectedEntries = {};
-  for (const key of selectedKeys) {
-    selectedEntries[key] = results[key];
-  }
-
+  for (const key of selectedKeys) selectedEntries[key] = results[key];
   const report = {
     directory: dir,
     timestamp: new Date().toISOString(),
     analyses: { ...selectedEntries },
   };
-
-  // Build a structured, numbered checklist from the raw analyses so the
-  // agent has a canonical list of issues to address. The raw `analyses`
-  // are preserved so nothing downstream breaks.
   const summaryBefore = summarizeReport(report);
   report.checklist = formatChecklist(summaryBefore);
+  return { report, summaryBefore, selectedEntries };
+}
 
-  // Step 5: Write report to <dir>/_ppt-report/<timestamp>.json (persisted)
-  const reportPath = await writeReport(report, dir);
+function agentInfo(config) {
+  const agent = config.agent || {};
+  return { name: agent.name || 'agent', command: agent.command || '' };
+}
 
-  // Step 6: Invoke agent
-  const config = await loadConfig();
-
-  // Pre-agent summary: tell the user exactly what we're about to do.
+function printPreAgentSummary(summaryBefore, config, dir, reportPath) {
+  const { name: agentName, command } = agentInfo(config);
   console.log(
     '\n' +
       formatPreAgentSummary(
         {
           counts: summaryBefore.countsByKind,
           total: summaryBefore.total,
-          agentName: config.agent?.name ?? 'agent',
-          command: config.agent?.command ?? '',
+          agentName,
+          command,
           dir,
           reportPath,
         },
@@ -156,145 +121,133 @@ export async function mainFlow() {
       ) +
       '\n',
   );
+}
 
-  await invokeAgent(config.agent, reportPath, dir, { checklist: report.checklist });
-
-  // Step 7: Verification — re-run Fallow against the same directory, diff
-  // against the original summary, print results, and persist the diff.
-  const reportDir = path.dirname(reportPath);
-  const reportBase = path.basename(reportPath, '.json');
-
-  async function verifyAgainst(prevSummary, baseLabel) {
-    const verifySpinner = ora('Verifying with Fallow...').start();
-    let verifyResults;
-    try {
-      verifyResults = await runFallow(dir);
-      verifySpinner.succeed(chalk.green('Verifying with Fallow...'));
-    } catch (err) {
-      verifySpinner.fail(chalk.red('Verifying with Fallow...'));
-      throw err;
-    }
-    const verifyEntries = {};
-    for (const key of selectedKeys) {
-      verifyEntries[key] = verifyResults[key];
-    }
-    const verifyReport = {
-      directory: dir,
-      timestamp: new Date().toISOString(),
-      analyses: { ...verifyEntries },
-    };
-    const summaryAfter = summarizeReport(verifyReport);
-    const diff = diffSummaries(prevSummary, summaryAfter);
-    console.log(formatDiff(diff, { color: true }));
-
-    const verificationPath = path.join(reportDir, `${baseLabel}-verification.json`);
-    await fsPromises.writeFile(
-      verificationPath,
-      JSON.stringify({ before: prevSummary, after: summaryAfter, diff }, null, 2),
-      'utf8',
-    );
-    return { summaryAfter, diff };
+async function verifyAgainst(dir, selectedKeys, prevSummary, baseLabel, reportDir) {
+  const verifySpinner = ora('Verifying with Fallow...').start();
+  let verifyResults;
+  try {
+    verifyResults = await runFallow(dir);
+    verifySpinner.succeed(chalk.green('Verifying with Fallow...'));
+  } catch (err) {
+    verifySpinner.fail(chalk.red('Verifying with Fallow...'));
+    throw err;
   }
+  const verifyEntries = {};
+  for (const key of selectedKeys) verifyEntries[key] = verifyResults[key];
+  const verifyReport = {
+    directory: dir,
+    timestamp: new Date().toISOString(),
+    analyses: { ...verifyEntries },
+  };
+  const summaryAfter = summarizeReport(verifyReport);
+  const diff = diffSummaries(prevSummary, summaryAfter);
+  console.log(formatDiff(diff, { color: true }));
+  const verificationPath = path.join(reportDir, `${baseLabel}-verification.json`);
+  await fsPromises.writeFile(
+    verificationPath,
+    JSON.stringify({ before: prevSummary, after: summaryAfter, diff }, null, 2),
+    'utf8',
+  );
+  return { summaryAfter, diff };
+}
 
-  // Round 1 verification (against the original summary).
-  let { summaryAfter, diff } = await verifyAgainst(summaryBefore, reportBase);
+async function promptRetry(remainingCount) {
+  const { retry } = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'retry',
+      message: `${remainingCount} issue${remainingCount === 1 ? '' : 's'} still remaining. Retry with the agent?`,
+      default: false,
+    },
+  ]);
+  return retry;
+}
 
-  // Track totals across rounds (relative to the original summaryBefore).
-  // The diff returned by `verifyAgainst` is always against `summaryBefore`
-  // for round 1; for retry rounds we recompute against the original so the
-  // final summary numbers reflect overall progress.
+async function runRetryRound({ dir, selectedEntries, config, reportBase, reportDir, diff, round }) {
+  const retryChecklist = formatChecklistFromIssues(diff.remaining);
+  const nextRound = round + 1;
+  const roundReport = {
+    directory: dir,
+    timestamp: new Date().toISOString(),
+    analyses: { ...selectedEntries },
+    remaining: diff.remaining,
+    checklist: retryChecklist,
+    round: nextRound,
+  };
+  const roundPath = path.join(reportDir, `${reportBase}-round-${nextRound}.json`);
+  await fsPromises.writeFile(roundPath, JSON.stringify(roundReport, null, 2), 'utf8');
+  await invokeAgent(config.agent, roundPath, dir, { checklist: retryChecklist });
+  return nextRound;
+}
+
+async function verifyLoop({ dir, selectedKeys, selectedEntries, config, summaryBefore, reportBase, reportDir }) {
+  let { diff } = await verifyAgainst(dir, selectedKeys, summaryBefore, reportBase, reportDir);
   let round = 1;
   let prevRemainingCount = summaryBefore.total;
   let overallDiff = diff;
 
-  while (true) {
-    const remainingCount = diff.remainingCount;
-
-    if (remainingCount === 0) {
-      // Nothing left — stop without prompting.
-      break;
-    }
-    if (round >= MAX_ROUNDS) {
-      // Out of rounds.
-      const stop = shouldRetry({
-        remainingCount,
-        prevRemainingCount,
-        round,
-        maxRounds: MAX_ROUNDS,
-        userConfirmed: true,
-      });
-      // stop is for clarity; we just break.
-      void stop;
-      break;
-    }
-
-    // Ask the user whether to retry this round.
-    const { retry: userConfirmed } = await inquirer.prompt([
-      {
-        type: 'confirm',
-        name: 'retry',
-        message: `${remainingCount} issue${remainingCount === 1 ? '' : 's'} still remaining. Retry with the agent?`,
-        default: false,
-      },
-    ]);
-
+  while (diff.remainingCount > 0 && round < MAX_ROUNDS) {
+    const userConfirmed = await promptRetry(diff.remainingCount);
     const decision = shouldRetry({
-      remainingCount,
+      remainingCount: diff.remainingCount,
       prevRemainingCount,
       round,
       maxRounds: MAX_ROUNDS,
       userConfirmed,
     });
-
     if (!decision.retry) break;
-
-    // Build a fresh checklist from the remaining issues only.
-    const retryChecklist = formatChecklistFromIssues(diff.remaining);
-
-    // Write a per-round report file: <reportBase>-round-<N>.json.
-    const nextRound = round + 1;
-    const roundReport = {
-      directory: dir,
-      timestamp: new Date().toISOString(),
-      analyses: { ...selectedEntries },
-      remaining: diff.remaining,
-      checklist: retryChecklist,
-      round: nextRound,
-    };
-    const roundPath = path.join(reportDir, `${reportBase}-round-${nextRound}.json`);
-    await fsPromises.writeFile(roundPath, JSON.stringify(roundReport, null, 2), 'utf8');
-
-    // Re-invoke the agent with only the remaining issues.
-    await invokeAgent(config.agent, roundPath, dir, { checklist: retryChecklist });
-
-    // Re-verify against the original summary so reported counts are absolute.
-    prevRemainingCount = remainingCount;
-    round = nextRound;
-    const result = await verifyAgainst(summaryBefore, `${reportBase}-round-${round}`);
-    summaryAfter = result.summaryAfter;
-    diff = result.diff;
+    prevRemainingCount = diff.remainingCount;
+    round = await runRetryRound({ dir, selectedEntries, config, reportBase, reportDir, diff, round });
+    ({ diff } = await verifyAgainst(dir, selectedKeys, summaryBefore, `${reportBase}-round-${round}`, reportDir));
     overallDiff = diff;
   }
 
+  return { overallDiff, round };
+}
+
+function finalLineColor(overallDiff) {
+  if (overallDiff.introducedCount > 0) return chalk.red;
+  if (overallDiff.remainingCount > 0) return chalk.yellow;
+  return chalk.green;
+}
+
+function printFinalResults(overallDiff, round, reportDir) {
   const finalLine = `Final: ${overallDiff.fixedCount} fixed, ${overallDiff.remainingCount} remaining, ${overallDiff.introducedCount} introduced over ${round} round${round === 1 ? '' : 's'}.`;
-
-  let coloredFinal;
-  if (overallDiff.introducedCount > 0) {
-    coloredFinal = chalk.red(finalLine);
-  } else if (overallDiff.remainingCount > 0) {
-    coloredFinal = chalk.yellow(finalLine);
-  } else {
-    coloredFinal = chalk.green(finalLine);
-  }
-  console.log(coloredFinal);
-
+  console.log(finalLineColor(overallDiff)(finalLine));
   if (overallDiff.remainingCount === 0 && overallDiff.introducedCount === 0) {
     console.log(chalk.green('All Fallow issues resolved.'));
   } else {
-    console.log(
-      chalk.yellow(`Some issues remain — see verification report at ${reportDir}.`),
-    );
+    console.log(chalk.yellow(`Some issues remain — see verification report at ${reportDir}.`));
   }
+}
+
+export async function mainFlow() {
+  const dir = await promptDirectory();
+  const analysisKeys = ['dead-code', 'dupes', 'health'];
+  const results = await runAnalysesWithSpinners(dir, analysisKeys);
+  const selectedKeys = await promptForAnalyses(analysisKeys, results);
+  if (selectedKeys.length === 0) {
+    console.log(chalk.red('No analyses selected. Exiting.'));
+    return;
+  }
+  const { report, summaryBefore, selectedEntries } = buildInitialReport(dir, selectedKeys, results);
+  const reportPath = await writeReport(report, dir);
+  const config = await loadConfig();
+  printPreAgentSummary(summaryBefore, config, dir, reportPath);
+  await invokeAgent(config.agent, reportPath, dir, { checklist: report.checklist });
+  const reportDir = path.dirname(reportPath);
+  const reportBase = path.basename(reportPath, '.json');
+  const { overallDiff, round } = await verifyLoop({
+    dir,
+    selectedKeys,
+    selectedEntries,
+    config,
+    summaryBefore,
+    reportBase,
+    reportDir,
+  });
+  printFinalResults(overallDiff, round, reportDir);
 }
 
 export async function runConfigWizard() {

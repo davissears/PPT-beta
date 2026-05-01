@@ -1,107 +1,91 @@
-/**
- * report.js — convert a Fallow report (as built by mainFlow in index.js)
- * into a structured, numbered checklist for downstream agents and verification.
- *
- * The report shape is:
- *   { directory, timestamp, analyses: { 'dead-code': {success, output, error}, ... } }
- *
- * `output` is expected to be the raw JSON string produced by Fallow. Because
- * Fallow's exact output shape varies, we defensively accept:
- *   - an array of items
- *   - an object with an `issues` / `results` / `findings` array
- *   - an object whose values are arrays
- */
-
 const FILE_KEYS = ['file', 'filename', 'path'];
 const LINE_KEYS = ['line', 'lineNumber'];
 const MESSAGE_KEYS = ['message', 'description', 'reason'];
 const ARRAY_CONTAINER_KEYS = ['issues', 'results', 'findings'];
 
 function firstDefined(obj, keys) {
-  if (!obj || typeof obj !== 'object') return null;
-  for (const k of keys) {
-    if (obj[k] !== undefined && obj[k] !== null) return obj[k];
-  }
-  return null;
+  if (obj == null || typeof obj !== 'object') return null;
+  const k = keys.find((key) => obj[key] != null);
+  return k !== undefined ? obj[k] : null;
+}
+
+function locStart(item) {
+  return item && item.loc && item.loc.start;
 }
 
 function extractLine(item) {
   const direct = firstDefined(item, LINE_KEYS);
   if (direct !== null) return direct;
-  if (item && typeof item === 'object' && item.loc && item.loc.start && item.loc.start.line !== undefined) {
-    return item.loc.start.line;
+  const start = locStart(item);
+  return (start && start.line !== undefined) ? start.line : null;
+}
+
+function isPlainObject(v) {
+  return v != null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function findArrayContainer(parsed) {
+  for (const key of ARRAY_CONTAINER_KEYS) {
+    if (Array.isArray(parsed[key])) return parsed[key];
   }
   return null;
 }
 
-/**
- * Coerce a parsed-JSON value into a flat list of issue items.
- */
-function coerceToItems(parsed) {
-  if (Array.isArray(parsed)) return parsed;
-  if (parsed === null || typeof parsed !== 'object') return [];
-
-  for (const key of ARRAY_CONTAINER_KEYS) {
-    if (Array.isArray(parsed[key])) return parsed[key];
-  }
-
-  // Fall back: treat as object whose values are arrays. Concatenate every
-  // array-valued field, in declaration order.
+function collectArrayValues(parsed) {
   const collected = [];
   for (const value of Object.values(parsed)) {
-    if (Array.isArray(value)) {
-      collected.push(...value);
-    }
+    if (Array.isArray(value)) collected.push(...value);
   }
   return collected;
+}
+
+function coerceToItems(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (!isPlainObject(parsed)) return [];
+  return findArrayContainer(parsed) ?? collectArrayValues(parsed);
+}
+
+function parseAnalysisOutput(entry) {
+  if (!entry || entry.success === false) return null;
+  try {
+    return JSON.parse(entry.output);
+  } catch {
+    return null;
+  }
+}
+
+function mapItem(raw, kind, id) {
+  return {
+    id,
+    kind,
+    file: firstDefined(raw, FILE_KEYS),
+    line: extractLine(raw),
+    message: firstDefined(raw, MESSAGE_KEYS),
+    raw,
+  };
+}
+
+function processKind(analyses, kind, issues, countsByKind, nextId) {
+  const parsed = parseAnalysisOutput(analyses[kind]);
+  if (!parsed) return nextId;
+  const items = coerceToItems(parsed);
+  if (items.length === 0) return nextId;
+  for (const raw of items) {
+    issues.push(mapItem(raw, kind, nextId++));
+  }
+  countsByKind[kind] = items.length;
+  return nextId;
 }
 
 export function summarizeReport(report) {
   const issues = [];
   const countsByKind = {};
   let nextId = 1;
-
   const analyses = (report && report.analyses) || {};
-
   for (const kind of Object.keys(analyses)) {
-    const entry = analyses[kind];
-    if (!entry || entry.success === false) continue;
-
-    let parsed;
-    try {
-      parsed = JSON.parse(entry.output);
-    } catch {
-      continue;
-    }
-
-    const items = coerceToItems(parsed);
-    if (items.length === 0) continue;
-
-    let kindCount = 0;
-    for (const raw of items) {
-      const file = firstDefined(raw, FILE_KEYS);
-      const line = extractLine(raw);
-      const message = firstDefined(raw, MESSAGE_KEYS);
-
-      issues.push({
-        id: nextId++,
-        kind,
-        file: file ?? null,
-        line: line ?? null,
-        message: message ?? null,
-        raw,
-      });
-      kindCount++;
-    }
-
-    if (kindCount > 0) countsByKind[kind] = kindCount;
+    nextId = processKind(analyses, kind, issues, countsByKind, nextId);
   }
-
-  return {
-    issues,
-    countsByKind,
-    total: issues.length,
-  };
+  return { issues, countsByKind, total: issues.length };
 }
 
 function padKind(kind, width) {
@@ -109,61 +93,39 @@ function padKind(kind, width) {
   return kind + ' '.repeat(width - kind.length);
 }
 
-/**
- * Build a stable key for an issue. Two issues are "the same" when their
- * kind+file+line+message tuples are equal. `null` equals `null`.
- */
 function issueKey(issue) {
-  return JSON.stringify([
-    issue.kind ?? null,
-    issue.file ?? null,
-    issue.line ?? null,
-    issue.message ?? null,
-  ]);
+  return JSON.stringify([issue.kind, issue.file, issue.line, issue.message]);
 }
 
-/**
- * Diff two summary objects (output of summarizeReport). Returns
- * { fixed, remaining, introduced, fixedCount, remainingCount, introducedCount }.
- *
- * - fixed: issues present in `before` but not in `after`
- * - remaining: issues present in both (the `before` instance is preserved so
- *   the original id is reported to the user)
- * - introduced: issues present in `after` but not in `before`
- */
+function extractIssues(summary) {
+  return (summary && summary.issues) || [];
+}
+
+function buildIssueMap(issues) {
+  const map = new Map();
+  for (const issue of issues) {
+    map.set(issueKey(issue), issue);
+  }
+  return map;
+}
+
+function partitionByMap(issues, map) {
+  const hit = [];
+  const miss = [];
+  for (const issue of issues) {
+    if (map.has(issueKey(issue))) hit.push(issue);
+    else miss.push(issue);
+  }
+  return { hit, miss };
+}
+
 export function diffSummaries(before, after) {
-  const beforeIssues = (before && before.issues) || [];
-  const afterIssues = (after && after.issues) || [];
-
-  const beforeMap = new Map();
-  for (const issue of beforeIssues) {
-    beforeMap.set(issueKey(issue), issue);
-  }
-  const afterMap = new Map();
-  for (const issue of afterIssues) {
-    afterMap.set(issueKey(issue), issue);
-  }
-
-  const fixed = [];
-  const remaining = [];
-  const introduced = [];
-
-  for (const issue of beforeIssues) {
-    const key = issueKey(issue);
-    if (afterMap.has(key)) {
-      remaining.push(issue);
-    } else {
-      fixed.push(issue);
-    }
-  }
-
-  for (const issue of afterIssues) {
-    const key = issueKey(issue);
-    if (!beforeMap.has(key)) {
-      introduced.push(issue);
-    }
-  }
-
+  const beforeIssues = extractIssues(before);
+  const afterIssues = extractIssues(after);
+  const beforeMap = buildIssueMap(beforeIssues);
+  const afterMap = buildIssueMap(afterIssues);
+  const { hit: remaining, miss: fixed } = partitionByMap(beforeIssues, afterMap);
+  const { miss: introduced } = partitionByMap(afterIssues, beforeMap);
   return {
     fixed,
     remaining,
@@ -174,20 +136,19 @@ export function diffSummaries(before, after) {
   };
 }
 
+function issueLocation(issue) {
+  if (!issue.file) return '';
+  return issue.line != null ? `${issue.file}:${issue.line}` : issue.file;
+}
+
 function formatIssueLine(issue, idLabel) {
   const parts = [`[${idLabel} ${issue.id}]`, issue.kind];
-  let location = '';
-  if (issue.file) {
-    location = issue.line != null ? `${issue.file}:${issue.line}` : issue.file;
-  }
+  const location = issueLocation(issue);
   if (location) parts.push(location);
   if (issue.message) parts.push(issue.message);
   return '  ' + parts.join('  ');
 }
 
-// Minimal ANSI color helpers. We avoid importing chalk into report.js to keep
-// the module dependency-free and easy to test; the escape sequences below are
-// the standard SGR codes that chalk also emits.
 const ANSI = {
   reset: '\x1b[0m',
   green: '\x1b[32m',
@@ -201,121 +162,88 @@ function wrap(code, text) {
   return `${code}${text}${ANSI.reset}`;
 }
 
+function colorCount(count, zeroCode, nonZeroCode, str) {
+  return count > 0 ? wrap(nonZeroCode, str) : wrap(zeroCode, str);
+}
+
+function formatCountLines(diff, color) {
+  const fStr = String(diff.fixedCount);
+  const rStr = String(diff.remainingCount);
+  const iStr = String(diff.introducedCount);
+  if (!color) {
+    return [
+      `  Fixed:       ${fStr}`,
+      `  Remaining:   ${rStr}`,
+      `  Introduced:  ${iStr}`,
+    ];
+  }
+  return [
+    `  Fixed:       ${wrap(ANSI.green, fStr)}`,
+    `  Remaining:   ${colorCount(diff.remainingCount, ANSI.dim, ANSI.yellow, rStr)}`,
+    `  Introduced:  ${colorCount(diff.introducedCount, ANSI.dim, ANSI.red, iStr)}`,
+  ];
+}
+
+function appendIssueSection(sections, issues, label, idLabel) {
+  if (!issues || issues.length === 0) return;
+  sections.push('');
+  sections.push(label);
+  for (const issue of issues) {
+    sections.push(formatIssueLine(issue, idLabel));
+  }
+}
+
 export function formatDiff(diff, { color = false } = {}) {
-  const sections = [];
-  sections.push('Verification:');
-
-  const fixedNum = String(diff.fixedCount);
-  const remainingNum = String(diff.remainingCount);
-  const introducedNum = String(diff.introducedCount);
-
-  if (color) {
-    const fixed = wrap(ANSI.green, fixedNum);
-    const remaining =
-      diff.remainingCount > 0
-        ? wrap(ANSI.yellow, remainingNum)
-        : wrap(ANSI.dim, remainingNum);
-    const introduced =
-      diff.introducedCount > 0
-        ? wrap(ANSI.red, introducedNum)
-        : wrap(ANSI.dim, introducedNum);
-    sections.push(`  Fixed:       ${fixed}`);
-    sections.push(`  Remaining:   ${remaining}`);
-    sections.push(`  Introduced:  ${introduced}`);
-  } else {
-    sections.push(`  Fixed:       ${fixedNum}`);
-    sections.push(`  Remaining:   ${remainingNum}`);
-    sections.push(`  Introduced:  ${introducedNum}`);
-  }
-
-  if (diff.remaining && diff.remaining.length > 0) {
-    sections.push('');
-    sections.push('Remaining:');
-    for (const issue of diff.remaining) {
-      sections.push(formatIssueLine(issue, 'old-id'));
-    }
-  }
-
-  if (diff.introduced && diff.introduced.length > 0) {
-    sections.push('');
-    sections.push('Introduced:');
-    for (const issue of diff.introduced) {
-      sections.push(formatIssueLine(issue, 'new-id'));
-    }
-  }
-
+  const sections = ['Verification:', ...formatCountLines(diff, color)];
+  appendIssueSection(sections, diff.remaining, 'Remaining:', 'old-id');
+  appendIssueSection(sections, diff.introduced, 'Introduced:', 'new-id');
   return sections.join('\n');
 }
 
-/**
- * Build a human-readable pre-agent summary block. Pure helper so it can be
- * unit-tested without spinning up the whole CLI.
- *
- *   Found 22 issue(s):
- *     dead-code: 12
- *     dupes:      3
- *     health:     7
- *
- *   Sending to: Claude Code (claude)
- *   Working directory: /abs/path
- *   Report: /abs/path/_ppt-report/<ts>.json
- */
+function normalizeCounts(counts) {
+  return counts != null && typeof counts === 'object' ? counts : {};
+}
+
+function formatKindLine(kind, kindWidth, count) {
+  return `  ${padKind(`${kind}:`, kindWidth)} ${count}`;
+}
+
+function formatMetaLines(agentName, command, dir, reportPath, color) {
+  const sendingTo = `Sending to: ${agentName}${command ? ` (${command})` : ''}`;
+  const mayDim = (s) => color ? wrap(ANSI.dim, s) : s;
+  return [sendingTo, mayDim(`Working directory: ${dir}`), mayDim(`Report: ${reportPath}`)];
+}
+
 export function formatPreAgentSummary(
   { counts, total, agentName, command, dir, reportPath },
   { color = false } = {},
 ) {
-  const safeCounts = counts && typeof counts === 'object' ? counts : {};
+  const safeCounts = normalizeCounts(counts);
   const kinds = Object.keys(safeCounts);
   const kindWidth = kinds.reduce((max, k) => Math.max(max, k.length + 1), 0);
-
   const heading = `Found ${total} issue${total === 1 ? '' : '(s)'}:`;
-  const lines = [];
-  lines.push(color ? wrap(ANSI.bold, heading) : heading);
-
+  const lines = [color ? wrap(ANSI.bold, heading) : heading];
   for (const kind of kinds) {
-    const label = `${kind}:`;
-    const padded = label.length < kindWidth ? label + ' '.repeat(kindWidth - label.length) : label;
-    lines.push(`  ${padded} ${safeCounts[kind]}`);
+    lines.push(formatKindLine(kind, kindWidth, safeCounts[kind]));
   }
-
-  lines.push('');
-
-  const sendingLine = `Sending to: ${agentName}${command ? ` (${command})` : ''}`;
-  const dirLine = `Working directory: ${dir}`;
-  const reportLine = `Report: ${reportPath}`;
-
-  lines.push(sendingLine);
-  lines.push(color ? wrap(ANSI.dim, dirLine) : dirLine);
-  lines.push(color ? wrap(ANSI.dim, reportLine) : reportLine);
-
+  lines.push('', ...formatMetaLines(agentName, command, dir, reportPath, color));
   return lines.join('\n');
 }
 
-export function formatChecklist(summary) {
-  const { total, countsByKind, issues } = summary;
+function issueChecklistLine(issue, kindWidth) {
+  const kindCol = padKind(issue.kind || '', kindWidth);
+  const location = issueLocation(issue);
+  const parts = [`[${issue.id}]`, kindCol];
+  if (location) parts.push(location);
+  if (issue.message) parts.push(issue.message);
+  return parts.join('  ');
+}
+
+function buildChecklist(header, countsByKind, lines) {
   const kinds = Object.keys(countsByKind);
-  const summaryLine =
-    kinds.length === 0
-      ? ''
-      : '  ' + kinds.map((k) => `${k}: ${countsByKind[k]}`).join(', ');
-
-  const header = `Fallow found ${total} issue${total === 1 ? '' : 's'}:`;
-
-  const kindWidth = issues.reduce((max, i) => Math.max(max, i.kind.length), 0);
-
-  const lines = issues.map((issue) => {
-    const kindCol = padKind(issue.kind, kindWidth);
-    let location = '';
-    if (issue.file) {
-      location = issue.line != null ? `${issue.file}:${issue.line}` : issue.file;
-    }
-
-    const parts = [`[${issue.id}]`, kindCol];
-    if (location) parts.push(location);
-    if (issue.message) parts.push(issue.message);
-    return parts.join('  ');
-  });
-
+  const summaryLine = kinds.length === 0
+    ? ''
+    : '  ' + kinds.map((k) => `${k}: ${countsByKind[k]}`).join(', ');
   const sections = [header];
   if (summaryLine) sections.push(summaryLine);
   if (lines.length > 0) {
@@ -325,36 +253,20 @@ export function formatChecklist(summary) {
   return sections.join('\n');
 }
 
-/**
- * Build a checklist string from a flat array of issue objects (the same
- * shape produced by `summarizeReport().issues`). Used for retry rounds
- * where only the remaining (unfixed) issues should be passed to the agent.
- *
- * The returned string starts with a count header, e.g.
- *   "3 issues remaining from previous round:"
- * followed by per-issue lines in the same format as `formatChecklist`.
- */
+export function formatChecklist(summary) {
+  const { total, countsByKind, issues } = summary;
+  const header = `Fallow found ${total} issue${total === 1 ? '' : 's'}:`;
+  const kindWidth = issues.reduce((max, i) => Math.max(max, i.kind.length), 0);
+  const lines = issues.map((issue) => issueChecklistLine(issue, kindWidth));
+  return buildChecklist(header, countsByKind, lines);
+}
+
 export function formatChecklistFromIssues(issues) {
   const safe = Array.isArray(issues) ? issues : [];
   const count = safe.length;
   const header = `${count} issue${count === 1 ? '' : 's'} remaining from previous round:`;
-
   if (count === 0) return header;
-
   const kindWidth = safe.reduce((max, i) => Math.max(max, (i.kind || '').length), 0);
-
-  const lines = safe.map((issue) => {
-    const kindCol = padKind(issue.kind || '', kindWidth);
-    let location = '';
-    if (issue.file) {
-      location = issue.line != null ? `${issue.file}:${issue.line}` : issue.file;
-    }
-
-    const parts = [`[${issue.id}]`, kindCol];
-    if (location) parts.push(location);
-    if (issue.message) parts.push(issue.message);
-    return parts.join('  ');
-  });
-
+  const lines = safe.map((issue) => issueChecklistLine(issue, kindWidth));
   return [header, '', lines.join('\n')].join('\n');
 }
